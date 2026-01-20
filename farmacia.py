@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, date
 from fpdf import FPDF
 import uuid
@@ -13,599 +14,489 @@ st.set_page_config(
     page_icon="🏥"
 )
 
-# --- 2. BASE DE DATOS (GESTIÓN ROBUSTA) ---
+# --- 2. CONEXIÓN GOOGLE SHEETS ---
 
-def get_db_connection():
-    conn = sqlite3.connect('farmacia.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    # Crear tablas
-    c.execute('''CREATE TABLE IF NOT EXISTS inventory
-                 (ID TEXT PRIMARY KEY, Nombre TEXT, Unidad TEXT, Stock INTEGER, StockMinimo INTEGER, Gestion TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS residents
-                 (ID TEXT PRIMARY KEY, Nombre TEXT, RUT TEXT, Piso TEXT, Habitacion TEXT, Apoderado TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS movements
-                 (ID INTEGER PRIMARY KEY AUTOINCREMENT, Fecha TEXT, Tipo TEXT, ResidenteID TEXT, InsumoID TEXT, NombreInsumo TEXT, Cantidad INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (Username TEXT PRIMARY KEY, Password TEXT, Role TEXT)''')
-    
-    # Migración: Asegurar columna Gestion
+def get_sheet_connection():
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     try:
-        c.execute("SELECT Gestion FROM inventory LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE inventory ADD COLUMN Gestion TEXT DEFAULT 'Farmacia'")
-    
-    # Migración: Rellenar nulos antiguos con Farmacia
-    c.execute("UPDATE inventory SET Gestion = 'Farmacia' WHERE Gestion IS NULL OR Gestion = ''")
-    
-    # Usuarios por defecto (Actualizado con los 4 perfiles)
-    c.execute('SELECT count(*) FROM users')
-    if c.fetchone()[0] == 0:
-        users = [
-            ("visita", "visita123", "Visita"),
-            ("farma", "farma2024", "Farmacia"),
-            ("enfermera", "enfermera2024", "Enfermera Jefe"),
-            ("admin", "admin2024", "Administrador")
-        ]
-        c.executemany('INSERT INTO users VALUES (?,?,?)', users)
-    
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# --- 3. LOGICA DE NEGOCIO (FILTRADO PYTHON) ---
-
-def get_data_frames():
-    """Extrae toda la data cruda para procesarla con Pandas (Más seguro que SQL complejo)"""
-    conn = get_db_connection()
-    df_inv = pd.read_sql("SELECT * FROM inventory", conn)
-    df_res = pd.read_sql("SELECT * FROM residents", conn)
-    df_mov = pd.read_sql("SELECT * FROM movements", conn)
-    conn.close()
-    return df_inv, df_res, df_mov
-
-def register_consumption(res_id, ins_id, ins_name, qty):
-    conn = get_db_connection()
-    try:
-        # Descontar stock
-        conn.execute("UPDATE inventory SET Stock = Stock - ? WHERE ID = ?", (qty, ins_id))
-        # Registrar movimiento
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        conn.execute("INSERT INTO movements (Fecha, Tipo, ResidenteID, InsumoID, NombreInsumo, Cantidad) VALUES (?,?,?,?,?,?)",
-                     (now, 'CONSUMO', res_id, ins_id, ins_name, qty))
-        conn.commit()
-        return True
+        # Intenta leer desde secrets (Producción)
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        sheet = client.open("Farmacia_DB") 
+        return sheet
     except Exception as e:
-        st.error(f"Error DB: {e}")
-        return False
-    finally:
-        conn.close()
+        st.error(f"Error conectando a Google Sheets: {e}")
+        st.stop()
 
-# --- 4. GENERACIÓN PDF ---
-
-def clean_text(text):
+def init_db_sheets():
+    """Inicializa las hojas si no existen"""
     try:
-        return str(text).encode('latin-1', 'replace').decode('latin-1')
-    except:
-        return str(text)
+        sh = get_sheet_connection()
+        try:
+            ws_titles = [ws.title for ws in sh.worksheets()]
+        except:
+            ws_titles = []
+            
+        tables = {
+            "Inventory": ["ID", "Nombre", "Unidad", "Stock", "StockMinimo", "Gestion"],
+            "Residents": ["ID", "Nombre", "RUT", "Piso", "Habitacion", "Apoderado"],
+            "Movements": ["ID", "Fecha", "Tipo", "ResidenteID", "InsumoID", "NombreInsumo", "Cantidad", "Gestion"],
+            "Users": ["Username", "Password", "Role"]
+        }
+        
+        for name, cols in tables.items():
+            if name not in ws_titles:
+                ws = sh.add_worksheet(title=name, rows=100, cols=20)
+                ws.append_row(cols)
+                if name == "Users":
+                    ws.append_rows([
+                        ["visita", "visita123", "Visita"],
+                        ["farma", "farma2024", "Farmacia"],
+                        ["enfermera", "enfermera2024", "Enfermera Jefe"],
+                        ["admin", "admin2024", "Administrador"]
+                    ])
+    except Exception as e:
+        st.error(f"Error inicializando DB: {e}")
 
+# Cache inteligente (TTL corto para ver actualizaciones rápido)
+@st.cache_data(ttl=3) 
+def load_data():
+    sh = get_sheet_connection()
+    
+    def get_df(ws_name):
+        try:
+            ws = sh.worksheet(ws_name)
+            data = ws.get_all_records()
+            df = pd.DataFrame(data)
+            # BLINDAJE DE DATOS: Convertir todo a string para evitar errores de tipo
+            for col in df.columns:
+                df[col] = df[col].astype(str).str.strip()
+            return df
+        except:
+            return pd.DataFrame()
+
+    return get_df("Inventory"), get_df("Residents"), get_df("Movements"), get_df("Users")
+
+# --- FUNCIONES DE ESCRITURA ---
+def add_row_to_sheet(ws_name, row_data):
+    sh = get_sheet_connection()
+    ws = sh.worksheet(ws_name)
+    # Convertir a string para consistencia
+    row_data = [str(x) for x in row_data]
+    ws.append_row(row_data)
+    load_data.clear()
+
+def update_stock_sheet(insumo_id, qty, operation="subtract"):
+    sh = get_sheet_connection()
+    ws = sh.worksheet("Inventory")
+    try:
+        cell = ws.find(str(insumo_id))
+        if cell:
+            # Stock en columna 4 (D)
+            curr_val = int(ws.cell(cell.row, 4).value)
+            new_val = curr_val - qty if operation == "subtract" else curr_val + qty
+            ws.update_cell(cell.row, 4, new_val)
+            load_data.clear()
+            return True
+        return False
+    except: return False
+
+def update_user_role(username, new_role, new_pass=None):
+    sh = get_sheet_connection()
+    ws = sh.worksheet("Users")
+    try:
+        cell = ws.find(str(username))
+        if cell:
+            ws.update_cell(cell.row, 3, new_role)
+            if new_pass:
+                ws.update_cell(cell.row, 2, new_pass)
+            load_data.clear()
+            return True
+    except: pass
+    return False
+
+def delete_user_row(username):
+    sh = get_sheet_connection()
+    ws = sh.worksheet("Users")
+    try:
+        cell = ws.find(str(username))
+        if cell:
+            ws.delete_rows(cell.row)
+            load_data.clear()
+            return True
+    except: pass
+    return False
+
+def delete_resident_row(res_id):
+    sh = get_sheet_connection()
+    ws = sh.worksheet("Residents")
+    try:
+        cell = ws.find(str(res_id))
+        if cell:
+            ws.delete_rows(cell.row)
+            load_data.clear()
+            return True
+    except: pass
+    return False
+
+def update_resident_row(res_id, nm, rt, ps, hb, ap):
+    sh = get_sheet_connection()
+    ws = sh.worksheet("Residents")
+    try:
+        cell = ws.find(str(res_id))
+        if cell:
+            r = cell.row
+            # Actualizar columnas 2 a 6
+            ws.update_cell(r, 2, nm)
+            ws.update_cell(r, 3, rt)
+            ws.update_cell(r, 4, ps)
+            ws.update_cell(r, 5, hb)
+            ws.update_cell(r, 6, ap)
+            load_data.clear()
+            return True
+    except: pass
+    return False
+
+# --- UTILS ---
+def generate_id(): return str(uuid.uuid4())[:8]
+def clean_text(t): return str(t).encode('latin-1','replace').decode('latin-1')
+
+# --- PDF ---
 class PDF(FPDF):
     def header(self):
-        self.set_font('Arial', 'B', 15)
-        self.cell(0, 10, 'Farmacia Ac - Reporte Oficial', 0, 1, 'C')
+        self.set_font('Arial','B',15)
+        self.cell(0,10,'Farmacia Ac - Reporte Oficial',0,1,'C')
         self.ln(5)
     def footer(self):
         self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.cell(0, 10, f'Pagina {self.page_no()}', 0, 0, 'C')
+        self.set_font('Arial','I',8)
+        self.cell(0,10,f'Pag {self.page_no()}',0,0,'C')
 
-def generate_pdf(resident_row, df_consumos, start, end, label):
+def make_pdf(res_data, df_mov, start, end, label):
     pdf = PDF()
     pdf.add_page()
-    
-    # Info Residente
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(0, 10, f"Residente: {clean_text(resident_row['Nombre'])}", 0, 1)
-    
-    pdf.set_font("Arial", size=10)
-    pdf.cell(0, 6, f"RUT: {resident_row['RUT']}", 0, 1)
-    pdf.cell(0, 6, f"Ubicacion: Piso {clean_text(resident_row['Piso'])} - Hab {clean_text(resident_row['Habitacion'])}", 0, 1)
-    pdf.cell(0, 6, f"Apoderado: {clean_text(resident_row['Apoderado'])}", 0, 1)
-    pdf.ln(3)
-    
-    pdf.set_font("Arial", 'I', 9)
-    pdf.cell(0, 6, f"Reporte: {clean_text(label)} | Del {start} al {end}", 0, 1)
+    pdf.set_font('Arial','B',12)
+    pdf.cell(0,10,f"Residente: {clean_text(res_data['Nombre'])}",0,1)
+    pdf.set_font('Arial',size=10)
+    pdf.cell(0,6,f"RUT: {res_data['RUT']}",0,1)
+    pdf.cell(0,6,f"Ubicacion: Piso {clean_text(res_data['Piso'])} - Hab {clean_text(res_data['Habitacion'])}",0,1)
+    pdf.cell(0,6,f"Apoderado: {clean_text(res_data['Apoderado'])}",0,1)
     pdf.ln(5)
-    
-    # Tabla
-    pdf.set_font("Arial", 'B', 10)
-    pdf.cell(40, 8, "Fecha", 1)
-    pdf.cell(80, 8, "Insumo", 1)
-    pdf.cell(40, 8, "Gestion", 1)
-    pdf.cell(30, 8, "Cantidad", 1)
+    pdf.set_font('Arial','I',9)
+    s_str = start.strftime('%d/%m/%Y')
+    e_str = end.strftime('%d/%m/%Y')
+    pdf.cell(0,6,f"Filtro: {clean_text(label)} | {s_str} - {e_str}",0,1)
+    pdf.ln(5)
+    pdf.set_font('Arial','B',10)
+    pdf.cell(40,8,"Fecha",1)
+    pdf.cell(70,8,"Insumo",1)
+    pdf.cell(40,8,"Gestion",1)
+    pdf.cell(30,8,"Cantidad",1)
     pdf.ln()
-    
-    pdf.set_font("Arial", size=9)
-    for _, row in df_consumos.iterrows():
-        # Fecha limpia
-        f_str = row['Fecha'] if isinstance(row['Fecha'], str) else row['Fecha'].strftime("%Y-%m-%d %H:%M")
-        
-        pdf.cell(40, 8, str(f_str), 1)
-        pdf.cell(80, 8, clean_text(row['NombreInsumo']), 1)
-        pdf.cell(40, 8, clean_text(row['Gestion']), 1)
-        pdf.cell(30, 8, str(row['Cantidad']), 1)
+    pdf.set_font('Arial',size=9)
+    for _,r in df_mov.iterrows():
+        pdf.cell(40,8,str(r['Fecha'])[:16],1)
+        pdf.cell(70,8,clean_text(r['NombreInsumo']),1)
+        pdf.cell(40,8,clean_text(r['Gestion']),1)
+        pdf.cell(30,8,str(r['Cantidad']),1)
         pdf.ln()
-        
     return pdf.output(dest='S').encode('latin-1')
 
-def generate_inventory_pdf(df_inv, user):
+def make_inv_pdf(df_inv, user):
     pdf = PDF()
     pdf.add_page()
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, "Inventario General", 0, 1, 'C')
-    pdf.set_font("Arial", 'I', 10)
-    pdf.cell(0, 10, f"Generado por: {clean_text(user)} | {datetime.now().strftime('%d/%m/%Y')}", 0, 1, 'C')
+    pdf.set_font('Arial','B',14)
+    pdf.cell(0,10,"Inventario General",0,1,'C')
+    pdf.set_font('Arial','I',10)
+    pdf.cell(0,10,f"Gen: {clean_text(user)} | {datetime.now().strftime('%d/%m/%Y')}",0,1,'C')
     pdf.ln(5)
-    
-    pdf.set_font("Arial", 'B', 9)
-    pdf.cell(70, 8, "Nombre", 1)
-    pdf.cell(30, 8, "Gestion", 1)
-    pdf.cell(30, 8, "Unidad", 1)
-    pdf.cell(30, 8, "Stock", 1)
-    pdf.cell(30, 8, "Minimo", 1)
-    pdf.ln()
-    
-    pdf.set_font("Arial", size=9)
-    for _, row in df_inv.iterrows():
-        pdf.cell(70, 8, clean_text(row['Nombre']), 1)
-        pdf.cell(30, 8, clean_text(row['Gestion']), 1)
-        pdf.cell(30, 8, clean_text(row['Unidad']), 1)
-        pdf.cell(30, 8, str(row['Stock']), 1)
-        pdf.cell(30, 8, str(row['StockMinimo']), 1)
-        pdf.ln()
-        
+    pdf.set_font('Arial','B',9)
+    pdf.cell(70,8,"Nombre",1); pdf.cell(30,8,"Gestion",1)
+    pdf.cell(30,8,"Unidad",1); pdf.cell(30,8,"Stock",1); pdf.ln()
+    pdf.set_font('Arial',size=9)
+    for _,r in df_inv.iterrows():
+        pdf.cell(70,8,clean_text(r['Nombre']),1)
+        pdf.cell(30,8,clean_text(r['Gestion']),1)
+        pdf.cell(30,8,clean_text(r['Unidad']),1)
+        pdf.cell(30,8,str(r['Stock']),1); pdf.ln()
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 5. INTERFAZ Y SESSION STATE ---
-
+# --- LOGICA APP ---
 if 'role' not in st.session_state: st.session_state.role = None
-if 'current_user' not in st.session_state: st.session_state.current_user = None
-
-def login_ui():
-    st.markdown("<h1 style='text-align: center;'>🏥 Farmacia Ac</h1>", unsafe_allow_html=True)
-    c1,c2,c3 = st.columns([1,2,1])
-    with c2:
-        with st.form("login"):
-            u = st.text_input("Usuario")
-            p = st.text_input("Contraseña", type="password")
-            if st.form_submit_button("Entrar", use_container_width=True):
-                conn = get_db_connection()
-                res = conn.execute("SELECT * FROM users WHERE Username=? AND Password=?", (u,p)).fetchone()
-                conn.close()
-                if res:
-                    st.session_state.role = res['Role']
-                    st.session_state.current_user = res['Username']
-                    st.rerun()
-                else:
-                    st.error("Acceso denegado")
 
 if not st.session_state.role:
-    login_ui()
-else:
-    # === APP LOGUEADA ===
-    role = st.session_state.role
-    user = st.session_state.current_user
-    
-    # Barra Superior
-    c1, c2 = st.columns([6,1])
-    with c1: st.title("🏥 Farmacia Ac")
+    init_db_sheets() # Intentar inicializar si es posible
+    st.markdown("<h1 style='text-align: center;'>🏥 Farmacia Ac</h1>", unsafe_allow_html=True)
+    c1,c2,c3=st.columns([1,2,1])
     with c2:
-        st.write(f"👤 **{user}** ({role})")
+        with st.form("log"):
+            u = st.text_input("Usuario")
+            p = st.text_input("Clave", type="password")
+            if st.form_submit_button("Entrar", use_container_width=True):
+                _, _, _, df_users = load_data()
+                if not df_users.empty:
+                    # Comparación estricta de strings
+                    match = df_users[(df_users['Username']==str(u)) & (df_users['Password']==str(p))]
+                    if not match.empty:
+                        st.session_state.role = match.iloc[0]['Role']
+                        st.session_state.user = match.iloc[0]['Username']
+                        st.rerun()
+                    else: st.error("Error credenciales")
+                else: st.error("Error conectando a DB Usuarios")
+else:
+    role = st.session_state.role
+    user = st.session_state.user
+    
+    # Carga de datos FRESCOS en cada recarga
+    df_inv, df_res, df_mov, df_usr = load_data()
+    
+    # Header
+    c1,c2 = st.columns([6,1])
+    with c1: st.title("🏥 Farmacia Ac")
+    with c2: 
+        st.write(f"👤 **{user}**")
         if st.button("Salir"):
             st.session_state.role = None
-            st.session_state.current_user = None
             st.rerun()
             
-    # Permisos
     is_admin = role == "Administrador"
     is_farma = role == "Farmacia"
-    is_enfermera = role == "Enfermera Jefe"
+    is_enfer = role == "Enfermera Jefe"
     
-    # Menú
     opts = ["Inventario"]
-    if role != "Visita":
-        opts.extend(["Cargar insumo a residente", "Reportes"])
-    if is_admin or is_farma or is_enfermera:
-        opts.append("Gestión")
-        
+    if role != "Visita": opts += ["Cargar insumo a residente", "Reportes"]
+    if is_admin or is_farma or is_enfer: opts.append("Gestión")
+    
     menu = st.sidebar.radio("Navegación", opts)
     
-    # --- PÁGINA: INVENTARIO ---
+    # --- INVENTARIO ---
     if menu == "Inventario":
         st.header("📦 Inventario")
-        df_i, _, _ = get_data_frames()
+        if not df_inv.empty:
+            st.download_button("📥 PDF Inventario", make_inv_pdf(df_inv, user), "inv.pdf", "application/pdf")
+        st.dataframe(df_inv, use_container_width=True)
         
-        if not df_i.empty:
-            st.download_button("📥 Descargar PDF Inventario", 
-                               data=generate_inventory_pdf(df_i, user), 
-                               file_name="Inventario.pdf", mime="application/pdf")
-        
-        st.dataframe(df_i, use_container_width=True)
-        
-        # Admin, Farmacia y Enfermera pueden ver operaciones
-        if is_admin or is_farma or is_enfermera:
-            st.subheader("Acciones")
-            t1, t2, t3 = st.tabs(["Nuevo", "Cargar Stock", "Importar Excel"])
-            
+        if role != "Visita":
+            t1, t2, t3 = st.tabs(["Nuevo", "Stock", "Excel"])
             with t1:
-                with st.form("new"):
-                    c_a, c_b = st.columns(2)
+                with st.form("ni"):
+                    c_a,c_b = st.columns(2)
                     nm = c_a.text_input("Nombre")
                     gs = c_a.selectbox("Gestión", ["Farmacia", "Enfermera Jefe"])
-                    un = c_b.selectbox("Unidad", ["unidades", "cajas", "ml", "mg"])
-                    stk = c_b.number_input("Stock Inicial", min_value=0)
-                    stm = c_a.number_input("Mínimo", min_value=1)
+                    un = c_b.selectbox("Unidad", ["unidades","cajas","ml"])
+                    stk = c_b.number_input("Stock",0)
+                    stm = c_a.number_input("Mín", 5)
                     if st.form_submit_button("Crear"):
-                        conn = get_db_connection()
-                        try:
-                            conn.execute("INSERT INTO inventory VALUES (?,?,?,?,?,?)", 
-                                         (generate_id(), nm, un, stk, stm, gs))
-                            conn.commit()
-                            st.success("Creado")
-                            st.rerun()
-                        except: st.error("Error")
-                        finally: conn.close()
+                        add_row_to_sheet("Inventory", [generate_id(), nm, un, stk, stm, gs])
+                        st.success("Creado (Recarga para ver ID)"); st.rerun()
             with t2:
-                # Cargar Stock Simple
-                all_items = df_i['Nombre'].tolist() if not df_i.empty else []
-                if all_items:
-                    sel = st.selectbox("Item", all_items)
-                    qty = st.number_input("Cantidad", min_value=1)
-                    if st.button("Agregar Stock"):
-                        conn = get_db_connection()
-                        # Buscar ID
-                        itm_id = df_i[df_i['Nombre'] == sel].iloc[0]['ID']
-                        conn.execute("UPDATE inventory SET Stock = Stock + ? WHERE ID=?", (qty, itm_id))
-                        # Registrar entrada como movimiento
-                        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        conn.execute("INSERT INTO movements (Fecha, Tipo, ResidenteID, InsumoID, NombreInsumo, Cantidad) VALUES (?,?,?,?,?,?)",
-                                     (now, 'ENTRADA', None, itm_id, sel, qty))
-                        conn.commit()
-                        conn.close()
-                        st.success("Stock actualizado")
-                        st.rerun()
+                if not df_inv.empty:
+                    items = df_inv['Nombre'].tolist()
+                    sel = st.selectbox("Item", items)
+                    qty = st.number_input("Cant",1)
+                    if st.button("Sumar"):
+                        iid = df_inv[df_inv['Nombre']==sel].iloc[0]['ID']
+                        ges = df_inv[df_inv['Nombre']==sel].iloc[0]['Gestion']
+                        if update_stock_sheet(iid, qty, "add"):
+                            add_row_to_sheet("Movements", [generate_id(), str(datetime.now())[:16], "ENTRADA", "", iid, sel, qty, ges])
+                            st.success("Ok"); st.rerun()
             with t3:
                 f = st.file_uploader("Excel", type=["xlsx"])
                 if f and st.button("Procesar"):
                     try:
-                        df = pd.read_excel(f)
-                        conn = get_db_connection()
-                        c = 0
-                        for _, r in df.iterrows():
-                            nm = str(r.iloc[0])
-                            qt = int(r.iloc[1]) if len(r)>1 else 0
-                            gs = str(r.iloc[2]) if len(r)>2 else "Farmacia"
-                            
-                            ex = conn.execute("SELECT ID FROM inventory WHERE Nombre=?", (nm,)).fetchone()
-                            if ex:
-                                conn.execute("UPDATE inventory SET Stock = Stock + ? WHERE ID=?", (qt, ex['ID']))
-                            else:
-                                conn.execute("INSERT INTO inventory VALUES (?,?,?,?,?,?)", 
-                                             (generate_id(), nm, "unidades", qt, 5, gs))
-                            c += 1
-                        conn.commit()
-                        conn.close()
-                        st.success(f"{c} procesados")
-                        st.rerun()
-                    except Exception as e: st.error(f"Error: {e}")
-
-    # --- PÁGINA: CARGAR INSUMO (UPDATED) ---
-    elif menu == "Cargar insumo a residente":
-        st.header("💊 Dispensar a Residente")
-        
-        # 1. Obtener datos frescos de la DB
-        conn = get_db_connection()
-        try:
-            res_rows = conn.execute("SELECT ID, Nombre, RUT FROM residents ORDER BY Nombre").fetchall()
-            inv_rows = conn.execute("SELECT ID, Nombre, Stock, Gestion FROM inventory ORDER BY Nombre").fetchall()
-        finally:
-            conn.close()
-            
-        if not res_rows or not inv_rows:
-            st.warning("Faltan residentes o insumos.")
-        else:
-            c1, c2, c3 = st.columns([3,3,2])
-            
-            with c1:
-                # Diccionario para Residente
-                res_dict = {f"{r['Nombre']} ({r['RUT']})": r['ID'] for r in res_rows}
-                res_options = list(res_dict.keys())
-                
-                # --- MEMORIA DE SELECCIÓN RESIDENTE ---
-                idx_res = 0
-                if 'last_res_id' in st.session_state:
-                    # Buscar el índice del ID guardado
-                    for i, name in enumerate(res_options):
-                        if res_dict[name] == st.session_state.last_res_id:
-                            idx_res = i
-                            break
-                            
-                sel_res_txt = st.selectbox("Residente", res_options, index=idx_res)
-                sel_res_id = res_dict[sel_res_txt]
-                
-            with c2:
-                # Diccionario para Insumo con formato (Stock entre paréntesis)
-                inv_dict = {}
-                for i in inv_rows:
-                    display = f"{i['Nombre']} ({i['Gestion']}) (Stock: {i['Stock']})"
-                    inv_dict[display] = {'id': i['ID'], 'stk': i['Stock'], 'nm': i['Nombre']}
-                
-                inv_options = list(inv_dict.keys())
-                
-                # --- MEMORIA DE SELECCIÓN INSUMO ---
-                idx_inv = 0
-                if 'last_inv_id' in st.session_state:
-                    for i, key in enumerate(inv_options):
-                        if inv_dict[key]['id'] == st.session_state.last_inv_id:
-                            idx_inv = i
-                            break
-                            
-                sel_inv_txt = st.selectbox("Insumo", inv_options, index=idx_inv)
-                sel_inv_data = inv_dict[sel_inv_txt]
-                
-            with c3:
-                cant = st.number_input("Cantidad", min_value=1, value=1)
-                
-            st.write("")
-            if st.button("Confirmar Carga", type="primary"):
-                if sel_inv_data['stk'] >= cant:
-                    if register_consumption(sel_res_id, sel_inv_data['id'], sel_inv_data['nm'], cant):
-                        # Guardar IDs en sesión para recuperar selección tras recarga
-                        st.session_state.last_res_id = sel_res_id
-                        st.session_state.last_inv_id = sel_inv_data['id']
-                        
-                        st.success("Registrado correctamente")
-                        st.rerun()
-                else:
-                    st.error("Stock insuficiente")
-
-    # --- PÁGINA: REPORTES (LÓGICA BLINDADA) ---
-    elif menu == "Reportes":
-        st.header("📄 Reportes de Consumo")
-        
-        # 1. Filtros
-        c1, c2 = st.columns(2)
-        today = date.today()
-        first = today.replace(day=1)
-        d_ini = c1.date_input("Desde", value=first)
-        d_fin = c2.date_input("Hasta", value=today)
-        
-        st.divider()
-        
-        # 2. Selector de Gestión
-        filtro_gestion = st.radio("Filtrar por Gestión:", ["General (Todos)", "Solo Farmacia", "Solo Enfermera Jefe"], horizontal=True)
-        
-        # 3. Procesamiento de Datos (PANDAS EN MEMORIA PARA SEGURIDAD)
-        df_inv, df_res, df_mov = get_data_frames()
-        
-        if df_mov.empty:
-            st.info("No hay movimientos registrados en el sistema.")
-        else:
-            # Limpieza y preparación para merge
-            # Asegurar que Gestion existe y está limpia
-            df_inv['Gestion'] = df_inv['Gestion'].fillna('Farmacia').astype(str).str.strip()
-            
-            # Merge 1: Movimientos + Inventario (Left join para no perder movimientos si borraron insumo)
-            df_merged = pd.merge(df_mov, df_inv[['ID', 'Gestion']], left_on='InsumoID', right_on='ID', how='left')
-            # Si no cruzó (insumo borrado), asignamos Farmacia por defecto
-            df_merged['Gestion'] = df_merged['Gestion'].fillna('Farmacia')
-            
-            # Filtro Tipo Consumo
-            df_consumos = df_merged[df_merged['Tipo'] == 'CONSUMO'].copy()
-            
-            # Filtro Fechas (Conversión robusta)
-            # Convertimos la columna Fecha (string) a datetime object
-            df_consumos['FechaDT'] = pd.to_datetime(df_consumos['Fecha'], errors='coerce') # Si falla, NaT
-            df_consumos = df_consumos.dropna(subset=['FechaDT']) # Eliminar fechas corruptas
-            
-            # Aplicar rango
-            mask_date = (df_consumos['FechaDT'].dt.date >= d_ini) & (df_consumos['FechaDT'].dt.date <= d_fin)
-            df_periodo = df_consumos[mask_date]
-            
-            # Filtro Gestión
-            if filtro_gestion == "Solo Farmacia":
-                df_final = df_periodo[df_periodo['Gestion'] == 'Farmacia']
-            elif filtro_gestion == "Solo Enfermera Jefe":
-                df_final = df_periodo[df_periodo['Gestion'] == 'Enfermera Jefe']
-            else:
-                df_final = df_periodo # Todos
-                
-            # Merge 2: Agregar nombres de residentes
-            # Asegurar IDs string
-            df_final['ResidenteID'] = df_final['ResidenteID'].astype(str)
-            df_res['ID'] = df_res['ID'].astype(str)
-            
-            df_view = pd.merge(df_final, df_res[['ID', 'Nombre', 'RUT', 'Piso', 'Habitacion', 'Apoderado']], 
-                               left_on='ResidenteID', right_on='ID', how='left')
-            
-            # 4. Selector de Residente (SIEMPRE VISIBLE)
-            # Lista única de residentes encontrados en la data filtrada
-            residentes_encontrados = sorted(df_view['Nombre'].dropna().unique().tolist())
-            
-            st.subheader("Selección de Residente")
-            
-            if not residentes_encontrados:
-                sel_res = st.selectbox("Residente", ["(No se encontraron consumos con este filtro)"], disabled=True)
-                st.warning("No hay datos para mostrar con los filtros seleccionados.")
-            else:
-                sel_res = st.selectbox("Residente", residentes_encontrados)
-                
-                # Filtrar data para ese residente específico
-                df_res_filtrado = df_view[df_view['Nombre'] == sel_res]
-                
-                # Mostrar Tabla
-                st.info(f"Mostrando: **{filtro_gestion}** para **{sel_res}**")
-                st.dataframe(df_res_filtrado[['Fecha', 'NombreInsumo', 'Gestion', 'Cantidad']], use_container_width=True)
-                
-                # Botón PDF
-                res_data = df_res[df_res['Nombre'] == sel_res].iloc[0]
-                pdf_bytes = generate_pdf(res_data, df_res_filtrado, d_ini, d_fin, filtro_gestion)
-                st.download_button("📥 Descargar Reporte PDF", data=pdf_bytes, file_name=f"Reporte_{sel_res}.pdf", mime="application/pdf")
-
-    # --- PÁGINA: GESTIÓN ---
-    elif menu == "Gestión":
-        st.header("🛠️ Gestión")
-        
-        # Tabs dinámicos
-        tabs_gestion = []
-        if is_admin:
-            tabs_gestion.append("Usuarios")
-        
-        # Residentes: Visible para Admin y Enfermera
-        if is_admin or is_enfermera:
-            tabs_gestion.append("Residentes")
-            
-        tabs = st.tabs(tabs_gestion)
-        
-        # === TAB: USUARIOS (SOLO ADMIN) ===
-        if is_admin:
-            with tabs[0]:
-                conn = get_db_connection()
-                df_users = pd.read_sql("SELECT Username, Role FROM users", conn)
-                conn.close()
-                st.dataframe(df_users, use_container_width=True)
-                
-                c_create, c_edit = st.columns(2)
-                
-                with c_create:
-                    st.markdown("#### Crear Usuario")
-                    with st.form("new_user_form"):
-                        nu = st.text_input("Usuario")
-                        np = st.text_input("Clave", type="password")
-                        nr = st.selectbox("Rol", ["Administrador", "Enfermera Jefe", "Farmacia", "Visita"])
-                        if st.form_submit_button("Crear"):
-                            conn = get_db_connection()
-                            try:
-                                conn.execute("INSERT INTO users VALUES (?,?,?)", (nu, np, nr))
-                                conn.commit()
-                                st.success("Creado")
-                                st.rerun()
-                            except: st.error("Error/Duplicado")
-                            finally: conn.close()
-                
-                with c_edit:
-                    st.markdown("#### Editar / Eliminar")
-                    user_edit = st.selectbox("Seleccionar Usuario", df_users['Username'].tolist())
-                    if user_edit:
-                        conn = get_db_connection()
-                        cur_role = conn.execute("SELECT Role FROM users WHERE Username=?", (user_edit,)).fetchone()[0]
-                        conn.close()
-                        
-                        with st.form("edit_user"):
-                            er = st.selectbox("Nuevo Rol", ["Administrador", "Enfermera Jefe", "Farmacia", "Visita"], index=["Administrador", "Enfermera Jefe", "Farmacia", "Visita"].index(cur_role))
-                            ep = st.text_input("Nueva Clave (opcional)", type="password")
-                            c1, c2 = st.columns(2)
-                            if c1.form_submit_button("Actualizar"):
-                                conn = get_db_connection()
-                                if ep: conn.execute("UPDATE users SET Role=?, Password=? WHERE Username=?", (er, ep, user_edit))
-                                else: conn.execute("UPDATE users SET Role=? WHERE Username=?", (er, user_edit))
-                                conn.commit()
-                                conn.close()
-                                st.success("Actualizado")
-                                st.rerun()
-                            if c2.form_submit_button("Eliminar", type="primary"):
-                                if user_edit == user: st.error("No puedes eliminarte.")
-                                else:
-                                    conn = get_db_connection()
-                                    conn.execute("DELETE FROM users WHERE Username=?", (user_edit,))
-                                    conn.commit()
-                                    conn.close()
-                                    st.success("Eliminado")
-                                    st.rerun()
-
-        # === TAB: RESIDENTES (ADMIN Y ENFERMERA) ===
-        # Determinar índice correcto para el tab de residentes
-        idx_res_tab = 1 if is_admin else 0 
-        
-        with tabs[idx_res_tab]:
-            _, df_r, _ = get_data_frames()
-            st.dataframe(df_r, use_container_width=True)
-            
-            # Sub-tabs para acciones
-            t_m, t_edit, t_e = st.tabs(["Nuevo (Manual)", "Editar / Eliminar", "Cargar Excel"])
-            
-            # 1. Crear
-            with t_m:
-                with st.form("nr"):
-                    c1,c2 = st.columns(2)
-                    nm = c1.text_input("Nombre")
-                    rt = c2.text_input("RUT")
-                    pi = c1.text_input("Piso")
-                    ha = c2.text_input("Habitación")
-                    ap = st.text_input("Apoderado")
-                    if st.form_submit_button("Guardar") and nm:
-                        conn = get_db_connection()
-                        conn.execute("INSERT INTO residents VALUES (?,?,?,?,?,?)", (generate_id(), nm, rt, pi, ha, ap))
-                        conn.commit()
-                        conn.close()
-                        st.success("Guardado")
-                        st.rerun()
-            
-            # 2. Editar / Eliminar (NUEVO)
-            with t_edit:
-                if not df_r.empty:
-                    res_to_edit_name = st.selectbox("Seleccionar Residente", df_r['Nombre'].tolist())
-                    res_data = df_r[df_r['Nombre'] == res_to_edit_name].iloc[0]
-                    
-                    with st.form("edit_res_form"):
-                        c1, c2 = st.columns(2)
-                        enm = c1.text_input("Nombre", value=res_data['Nombre'])
-                        ert = c2.text_input("RUT", value=res_data['RUT'])
-                        epi = c1.text_input("Piso", value=res_data['Piso'])
-                        eha = c2.text_input("Habitación", value=res_data['Habitacion'])
-                        eap = st.text_input("Apoderado", value=res_data['Apoderado'])
-                        
-                        col_upd, col_del = st.columns(2)
-                        if col_upd.form_submit_button("Actualizar Datos"):
-                            conn = get_db_connection()
-                            conn.execute("UPDATE residents SET Nombre=?, RUT=?, Piso=?, Habitacion=?, Apoderado=? WHERE ID=?",
-                                         (enm, ert, epi, eha, eap, res_data['ID']))
-                            conn.commit()
-                            conn.close()
-                            st.success("Residente actualizado.")
-                            st.rerun()
-                            
-                        if col_del.form_submit_button("Eliminar Residente", type="primary"):
-                            conn = get_db_connection()
-                            conn.execute("DELETE FROM residents WHERE ID=?", (res_data['ID'],))
-                            conn.commit()
-                            conn.close()
-                            st.success("Residente eliminado.")
-                            st.rerun()
-            
-            # 3. Carga Excel
-            with t_e:
-                f = st.file_uploader("Excel", type=["xlsx"])
-                if f and st.button("Cargar"):
-                    try:
                         d = pd.read_excel(f)
-                        conn = get_db_connection()
                         c = 0
                         for _,r in d.iterrows():
-                            n = str(r.iloc[0])
-                            ex = conn.execute("SELECT ID FROM residents WHERE Nombre=?", (n,)).fetchone()
-                            if not ex:
-                                conn.execute("INSERT INTO residents VALUES (?,?,?,?,?,?)",
-                                             (generate_id(), n, str(r.iloc[1]), str(r.iloc[2]), str(r.iloc[3]), str(r.iloc[4])))
-                                c += 1
-                        conn.commit()
-                        conn.close()
-                        st.success(f"{c} cargados")
-                        st.rerun()
+                            # Validar que no exista
+                            if str(r.iloc[0]) not in df_inv['Nombre'].values:
+                                add_row_to_sheet("Inventory", [generate_id(), str(r.iloc[0]), "unidades", int(r.iloc[1]), 5, str(r.iloc[2]) if len(r)>2 else "Farmacia"])
+                                c+=1
+                        st.success(f"{c} cargados"); st.rerun()
                     except Exception as e: st.error(f"Error: {e}")
+
+    # --- CARGAR (Con Memoria) ---
+    elif menu == "Cargar insumo a residente":
+        st.header("💊 Dispensar")
+        if df_inv.empty or df_res.empty: 
+            st.warning("Sin datos")
+        else:
+            c1,c2,c3 = st.columns([3,3,2])
+            
+            # 1. Selector Residente con memoria
+            r_dict = {f"{r['Nombre']} ({r['RUT']})": r['ID'] for _,r in df_res.iterrows()}
+            r_keys = list(r_dict.keys())
+            idx_r = 0
+            if 'mem_res_id' in st.session_state:
+                # Buscar el key que corresponde al ID guardado
+                found = [k for k,v in r_dict.items() if v == st.session_state.mem_res_id]
+                if found: idx_r = r_keys.index(found[0])
+            
+            sel_r_txt = c1.selectbox("Residente", r_keys, index=idx_r)
+            rid = r_dict[sel_r_txt]
+            
+            # 2. Selector Insumo con memoria
+            i_dict = {}
+            for _,row in df_inv.iterrows():
+                lbl = f"{row['Nombre']} ({row['Gestion']}) [Stk:{row['Stock']}]"
+                i_dict[lbl] = {'id': row['ID'], 'stk': int(row['Stock']), 'nm': row['Nombre'], 'gs': row['Gestion']}
+            i_keys = list(i_dict.keys())
+            idx_i = 0
+            if 'mem_inv_id' in st.session_state:
+                found_i = [k for k,v in i_dict.items() if v['id'] == st.session_state.mem_inv_id]
+                if found_i: idx_i = i_keys.index(found_i[0])
+                
+            sel_i_txt = c2.selectbox("Insumo", i_keys, index=idx_i)
+            idata = i_dict[sel_i_txt]
+            
+            qty = c3.number_input("Cant", 1)
+            
+            if st.button("Confirmar Carga", type="primary"):
+                if idata['stk'] >= qty:
+                    if update_stock_sheet(idata['id'], qty, "subtract"):
+                        add_row_to_sheet("Movements", [generate_id(), str(datetime.now())[:16], "CONSUMO", rid, idata['id'], idata['nm'], qty, idata['gs']])
+                        # Guardar en memoria
+                        st.session_state.mem_res_id = rid
+                        st.session_state.mem_inv_id = idata['id']
+                        st.success("Registrado"); st.rerun()
+                else: st.error("Stock bajo")
+
+    # --- REPORTES (CORREGIDO) ---
+    elif menu == "Reportes":
+        st.header("📄 Reportes")
+        c1,c2 = st.columns(2)
+        d_i = c1.date_input("Desde", date.today().replace(day=1))
+        d_f = c2.date_input("Hasta", date.today())
+        
+        st.divider()
+        filtro = st.radio("Filtro Gestión:", ["General (Todos)", "Solo Farmacia", "Solo Enfermera Jefe"], horizontal=True)
+        
+        if df_mov.empty: st.info("Sin movimientos")
+        else:
+            # 1. Merge Movimientos + Inventario (Para asegurar Gestion)
+            # Aunque Movimientos ya tiene Gestion (si se grabó bien), hacemos merge por seguridad si son datos antiguos
+            df_mov['InsumoID'] = df_mov['InsumoID'].astype(str)
+            df_inv['ID'] = df_inv['ID'].astype(str)
+            
+            # Left join para mantener movimientos aunque se borre insumo
+            df_full = pd.merge(df_mov, df_inv[['ID', 'Gestion']], left_on='InsumoID', right_on='ID', how='left', suffixes=('', '_inv'))
+            
+            # Prioridad: Gestion guardada en movimiento > Gestion del inventario actual > Default Farmacia
+            if 'Gestion_inv' in df_full.columns:
+                df_full['Gestion'] = df_full['Gestion'].replace('', pd.NA).fillna(df_full['Gestion_inv']).fillna('Farmacia')
+            else:
+                df_full['Gestion'] = df_full['Gestion'].replace('', 'Farmacia')
+
+            # 2. Filtrar fechas
+            df_full['DT'] = pd.to_datetime(df_full['Fecha'], format='mixed', dayfirst=False, errors='coerce')
+            df_full = df_full.dropna(subset=['DT'])
+            
+            mask_date = (df_full['Tipo']=="CONSUMO") & (df_full['DT'].dt.date >= d_i) & (df_full['DT'].dt.date <= d_f)
+            df_periodo = df_full[mask_date]
+            
+            # 3. Filtrar Gestion
+            if filtro == "Solo Farmacia":
+                df_final = df_periodo[df_periodo['Gestion'] == 'Farmacia']
+            elif filtro == "Solo Enfermera Jefe":
+                df_final = df_periodo[df_periodo['Gestion'] == 'Enfermera Jefe']
+            else:
+                df_final = df_periodo
+            
+            # 4. Unir con nombres de residentes
+            df_final['ResidenteID'] = df_final['ResidenteID'].astype(str)
+            df_view = pd.merge(df_final, df_res[['ID','Nombre']], left_on='ResidenteID', right_on='ID', how='left')
+            
+            # 5. Selector
+            res_list = sorted(df_view['Nombre'].dropna().unique().tolist())
+            
+            if not res_list:
+                st.selectbox("Residente", ["(Sin datos para este filtro)"], disabled=True)
+                st.warning(f"No hay consumos de '{filtro}' en este rango de fechas.")
+            else:
+                sel_res = st.selectbox("Residente", res_list)
+                if sel_res:
+                    df_user = df_view[df_view['Nombre'] == sel_res]
+                    st.info(f"Mostrando: {filtro} para {sel_res}")
+                    st.dataframe(df_user[['Fecha', 'NombreInsumo', 'Gestion', 'Cantidad']], use_container_width=True)
+                    
+                    # PDF
+                    try:
+                        res_data = df_res[df_res['Nombre'] == sel_res].iloc[0]
+                        st.download_button("📥 PDF", make_pdf(res_data, df_user, d_i, d_f, filtro), f"rep_{sel_res}.pdf", "application/pdf")
+                    except: st.error("Error generando PDF (datos incompletos del residente)")
+
+    # --- GESTIÓN ---
+    elif menu == "Gestión":
+        st.header("🛠️ Gestión")
+        t1, t2 = st.tabs(["Usuarios", "Residentes"])
+        
+        if is_admin:
+            with t1:
+                st.dataframe(df_usr)
+                c_cr, c_ed = st.columns(2)
+                with c_cr:
+                    with st.form("nu"):
+                        u = st.text_input("User"); p = st.text_input("Pass", type="password")
+                        r = st.selectbox("Rol", ["Visita","Farmacia","Enfermera Jefe","Administrador"])
+                        if st.form_submit_button("Crear"):
+                            if str(u) not in df_usr['Username'].values:
+                                add_row_to_sheet("Users", [u,p,r]); st.success("Ok"); st.rerun()
+                            else: st.error("Existe")
+                with c_ed:
+                    if not df_usr.empty:
+                        ue = st.selectbox("Editar", df_usr['Username'].tolist())
+                        if ue:
+                            with st.form("edu"):
+                                nr = st.selectbox("Rol", ["Visita","Farmacia","Enfermera Jefe","Administrador"])
+                                np = st.text_input("Pass (Opcional)", type="password")
+                                c_a, c_b = st.columns(2)
+                                if c_a.form_submit_button("Update"):
+                                    update_user_role(ue, nr, np if np else None)
+                                    st.success("Ok"); st.rerun()
+                                if c_b.form_submit_button("Delete", type="primary"):
+                                    if ue != user: delete_user_row(ue); st.success("Bye"); st.rerun()
+                                    else: st.error("No")
+
+        # Tab Residentes (Admin y Enfermera)
+        with t2:
+            st.dataframe(df_res)
+            if is_admin or is_enfer:
+                t_m, t_e, t_ed = st.tabs(["Nuevo", "Excel", "Editar"])
+                with t_m:
+                    with st.form("nr"):
+                        n = st.text_input("Nombre"); ru = st.text_input("RUT")
+                        p = st.text_input("Piso"); h = st.text_input("Hab")
+                        ap = st.text_input("Apod")
+                        if st.form_submit_button("Guardar"):
+                            add_row_to_sheet("Residents", [generate_id(), n, ru, p, h, ap])
+                            st.success("Ok"); st.rerun()
+                with t_e:
+                    f = st.file_uploader("XLSX", type=["xlsx"])
+                    if f and st.button("Cargar"):
+                        try:
+                            d = pd.read_excel(f)
+                            c=0
+                            for _,r in d.iterrows():
+                                if str(r.iloc[0]) not in df_res['Nombre'].values:
+                                    add_row_to_sheet("Residents", [generate_id(), str(r.iloc[0]), str(r.iloc[1]), str(r.iloc[2]), str(r.iloc[3]), str(r.iloc[4])])
+                                    c+=1
+                            st.success(f"{c} ok"); st.rerun()
+                        except: st.error("Error")
+                with t_ed:
+                    if not df_res.empty:
+                        re = st.selectbox("Residente", df_res['Nombre'].tolist())
+                        if re:
+                            rd = df_res[df_res['Nombre']==re].iloc[0]
+                            with st.form("edr"):
+                                nn = st.text_input("Nombre", rd['Nombre'])
+                                nru = st.text_input("RUT", rd['RUT'])
+                                np = st.text_input("Piso", rd['Piso'])
+                                nh = st.text_input("Hab", rd['Habitacion'])
+                                nap = st.text_input("Apod", rd['Apoderado'])
+                                c_up, c_dl = st.columns(2)
+                                if c_up.form_submit_button("Actualizar"):
+                                    update_resident_row(rd['ID'], nn, nru, np, nh, nap)
+                                    st.success("Ok"); st.rerun()
+                                if c_dl.form_submit_button("Borrar", type="primary"):
+                                    delete_resident_row(rd['ID'])
+                                    st.success("Bye"); st.rerun()
